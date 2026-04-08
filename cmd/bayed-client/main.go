@@ -16,7 +16,7 @@ func main() {
 	psk := flag.String("psk", "", "pre-shared key")
 	socksAddr := flag.String("socks", "127.0.0.1:1080", "local SOCKS5 listen address")
 	insecure := flag.Bool("insecure", false, "skip TLS cert verification")
-	fingerprint := flag.String("fingerprint", "chrome-pq", "TLS fingerprint: chrome-pq, chrome, firefox, safari, ios, edge, random, go")
+	fingerprint := flag.String("fingerprint", "chrome", "TLS fingerprint: chrome, chrome-pq, chrome-131, chrome-133, firefox, safari, ios, edge, random, go")
 	flag.Parse()
 
 	if *psk == "" {
