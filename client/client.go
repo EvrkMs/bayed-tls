@@ -41,6 +41,8 @@ type Config struct {
 	PSK         []byte // pre-shared key
 	Insecure    bool   // skip certificate verification (testing only)
 	Fingerprint string // uTLS fingerprint: chrome-pq, chrome, firefox, safari, ios, edge, random, go
+	FakePSK     bool   // inject fake pre_shared_key extension (~50% of connections)
+	PoolSize    int    // number of parallel TCP connections (0 or 1 = single conn)
 }
 
 // Client manages a bayed-tls connection.
@@ -75,6 +77,18 @@ func (c *Client) Connect() error {
 
 	helloID := ResolveFingerprint(c.cfg.Fingerprint)
 	uconn := tls.UClient(tcpConn, tlsCfg, helloID)
+
+	// Optionally inject fake PSK (~50% of connections) to look like session resumption.
+	if c.cfg.FakePSK && shouldUseFakePSK() {
+		if err := uconn.BuildHandshakeState(); err != nil {
+			tcpConn.Close()
+			return fmt.Errorf("build handshake state: %w", err)
+		}
+		if err := applyFakePSK(uconn, defaultFakePSK); err != nil {
+			log.Printf("[bayed-client] fake PSK injection failed (non-fatal): %v", err)
+		}
+	}
+
 	if err := uconn.Handshake(); err != nil {
 		tcpConn.Close()
 		return fmt.Errorf("tls handshake: %w", err)
