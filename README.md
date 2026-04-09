@@ -41,24 +41,24 @@ docker run -d -p 1080:1080 ghcr.io/evrkms/bayed-tls-client:latest \
 
 ## Client Flags
 
-| Flag | Default | Description |
-|------|---------|-------------|
-| `-server` | *required* | Server address (`host:port`) |
-| `-sni` | `google.com` | TLS SNI hostname |
-| `-psk` | *required* | Pre-shared key (or `BAYED_PSK` env) |
-| `-socks` | `127.0.0.1:1080` | Local SOCKS5 listen address |
-| `-fingerprint` | `chrome` | TLS fingerprint (`chrome`, `chrome-131`, `chrome-133`, `chrome-pq`, `firefox`, `safari`, `edge`) |
-| `-fake-psk` | `false` | Inject fake `pre_shared_key` in ~50% of connections |
-| `-pool` | `0` | Number of parallel connections (0 = single) |
-| `-insecure` | `false` | Skip TLS certificate verification |
+| Flag           | Default          | Description                                         |
+|----------------|------------------|-----------------------------------------------------|
+| `-server`      | *required*       | Server address (`host:port`)                        |
+| `-sni`         | `google.com`     | TLS SNI hostname                                    |
+| `-psk`         | *required*       | Pre-shared key (or `BAYED_PSK` env)                 |
+| `-socks`       | `127.0.0.1:1080` | Local SOCKS5 listen address                         |
+| `-fingerprint` | `chrome`         | TLS fingerprint (`uTLS version v1.8.2`)             |
+| `-fake-psk`    | `false`          | Inject fake `pre_shared_key` in ~50% of connections |
+| `-pool`        | `0`              | Number of parallel connections (0 = single)         |
+| `-insecure`    | `false`          | Skip TLS certificate verification                   |
 
 ## Server Flags
 
-| Flag | Default | Description |
-|------|---------|-------------|
-| `-listen` | `:443` | Listen address |
-| `-upstream` | `google.com:443` | Real TLS server for passthrough |
-| `-psk` | *required* | Pre-shared key (or `BAYED_PSK` env) |
+| Flag        | Default          | Description                         |
+|-------------|------------------|-------------------------------------|
+| `-listen`   | `:443`           | Listen address                      |
+| `-upstream` | `google.com:443` | Real TLS server for passthrough     |
+| `-psk`      | *required*       | Pre-shared key (or `BAYED_PSK` env) |
 
 ## Architecture
 
@@ -67,11 +67,11 @@ Client                          Server                        Google
   │                               │                             │
   │── TLS ClientHello (Chrome) ──→│── forward ClientHello ─────→│
   │←── ServerHello ──────────────←│←── forward ServerHello ────←│
-  │── [encrypted] ──────────────→│                              │
-  │   ... TLS handshake ...      │   ... TLS handshake ...      │
+  │── [encrypted]  ──────────────→│                             │
+  │   ... TLS handshake ...       │   ... TLS handshake ...     │
   │                               │                             │
-  │── auth beacon ──────────────→│ ✓ verify PSK+HKDF            │
-  │←── confirm ─────────────────←│ ✗ disconnect upstream        │
+  │── auth beacon  ──────────────→│ ✓ verify PSK+HKDF           |
+  │←── confirm  ─────────────────←│ ✗ disconnect upstream       │
   │                               │                             │
   │══ encrypted tunnel (AES-GCM) ═╡                             │
   │   ├─ stream 1: TCP proxy      │                             │
