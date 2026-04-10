@@ -14,6 +14,7 @@ package bayed
 
 import (
 	"log"
+	"sync/atomic"
 	"time"
 )
 
@@ -22,10 +23,15 @@ type ServerConfig struct {
 	// PSK is the pre-shared key used for client authentication.
 	PSK []byte
 
-	// UpstreamAddr is the real TLS server to proxy non-VPN traffic to
-	// (e.g. "google.com:443"). Unauthenticated connections are
-	// transparently forwarded here (active probe resistance).
+	// UpstreamAddr is the primary upstream TLS server (e.g. "google.com:443").
+	// Kept for backward compatibility. If Upstreams is set, this is ignored.
 	UpstreamAddr string
+
+	// Upstreams is a list of upstream TLS servers for round-robin rotation.
+	// Each entry is "host:port" (e.g. "www.google.com:443").
+	// Using multiple upstreams distributes handshake load and avoids
+	// anti-abuse bans from a single provider.
+	Upstreams []string
 
 	// UpstreamTimeout is the dial timeout for the upstream server.
 	// Default: 10s.
@@ -36,6 +42,9 @@ type ServerConfig struct {
 
 	// Logger is an optional logger. If nil, log.Default() is used.
 	Logger *log.Logger
+
+	// Internal round-robin counter.
+	rrCounter atomic.Uint64
 }
 
 func (c *ServerConfig) logger() *log.Logger {
@@ -50,6 +59,17 @@ func (c *ServerConfig) upstreamTimeout() time.Duration {
 		return c.UpstreamTimeout
 	}
 	return 10 * time.Second
+}
+
+// pickUpstream returns the next upstream address using round-robin.
+// If Upstreams is empty, falls back to UpstreamAddr.
+func (c *ServerConfig) pickUpstream() string {
+	ups := c.Upstreams
+	if len(ups) == 0 {
+		return c.UpstreamAddr
+	}
+	idx := c.rrCounter.Add(1) - 1
+	return ups[idx%uint64(len(ups))]
 }
 
 // ClientConfig configures the client-side bayed-tls handshake.

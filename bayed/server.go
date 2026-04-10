@@ -39,8 +39,9 @@ func Server(c net.Conn, config *ServerConfig) (*Conn, error) {
 	// Extract SNI from ClientHello for routing
 	sni := parseClientHelloSNI(payload)
 
-	// Step 2: Connect to upstream
-	upstream, err := net.DialTimeout("tcp", config.UpstreamAddr, config.upstreamTimeout())
+	// Step 2: Connect to upstream (round-robin if multiple configured)
+	upstreamAddr := config.pickUpstream()
+	upstream, err := net.DialTimeout("tcp", upstreamAddr, config.upstreamTimeout())
 	if err != nil {
 		return nil, err
 	}
