@@ -71,8 +71,8 @@ func Server(c net.Conn, config *ServerConfig) (*Conn, error) {
 
 	// No server_random → cannot authenticate, do passthrough
 	if serverRandom == nil {
-		go io.Copy(c, upstreamBuf)
-		io.Copy(upstream, clientBuf)
+		go func() { _, _ = io.Copy(c, upstreamBuf) }()
+		_, _ = io.Copy(upstream, clientBuf)
 		upstream.Close()
 		return nil, ErrNotBayed
 	}
@@ -88,7 +88,7 @@ func Server(c net.Conn, config *ServerConfig) (*Conn, error) {
 	upstreamDone := make(chan struct{})
 	go func() {
 		defer close(upstreamDone)
-		io.Copy(c, upstreamBuf)
+		_, _ = io.Copy(c, upstreamBuf)
 	}()
 
 	for {

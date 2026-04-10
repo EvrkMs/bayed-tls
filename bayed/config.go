@@ -13,7 +13,6 @@
 package bayed
 
 import (
-	"context"
 	"log"
 	"time"
 )
@@ -76,9 +75,6 @@ type ClientConfig struct {
 	// Show enables verbose debug output.
 	Show bool
 
-	// Ctx is the context for the handshake. If nil, context.Background() is used.
-	Ctx context.Context
-
 	// Logger is an optional logger. If nil, log.Default() is used.
 	Logger *log.Logger
 }
@@ -88,11 +84,4 @@ func (c *ClientConfig) logger() *log.Logger {
 		return c.Logger
 	}
 	return log.Default()
-}
-
-func (c *ClientConfig) context() context.Context {
-	if c.Ctx != nil {
-		return c.Ctx
-	}
-	return context.Background()
 }
