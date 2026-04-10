@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"fmt"
 	"net"
+	"time"
 
 	tls "github.com/refraction-networking/utls"
 )
@@ -83,7 +84,13 @@ func Client(c net.Conn, config *ClientConfig) (*Conn, error) {
 	// Step 5: Wait for server confirmation.
 	// We reuse tcpBuf (created before uTLS) which preserves any bytes
 	// that were read ahead during the handshake.
-	for i := 0; i < 10; i++ {
+	// Use a deadline instead of a record counter — upstream may send
+	// many records (NewSessionTicket, etc.) before our confirm arrives.
+	if err := rawConn.SetReadDeadline(time.Now().Add(10 * time.Second)); err != nil {
+		c.Close()
+		return nil, fmt.Errorf("set deadline: %w", err)
+	}
+	for {
 		recType, payload, _, err := readTLSRecord(tcpBuf)
 		if err != nil {
 			c.Close()
@@ -97,6 +104,9 @@ func Client(c net.Conn, config *ClientConfig) (*Conn, error) {
 				l.Printf("[bayed] server confirmed!")
 			}
 
+			// Clear deadline before entering tunnel mode.
+			_ = rawConn.SetReadDeadline(time.Time{})
+
 			// Step 6: Encrypted tunnel
 			conn, err := newConn(rawConn, tcpBuf, k, true)
 			if err != nil {
@@ -108,9 +118,6 @@ func Client(c net.Conn, config *ClientConfig) (*Conn, error) {
 			return conn, nil
 		}
 	}
-
-	c.Close()
-	return nil, fmt.Errorf("server did not confirm within 10 records")
 }
 
 // --- fingerprint helpers ---
