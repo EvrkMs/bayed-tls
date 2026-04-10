@@ -3,10 +3,13 @@ package bayed
 import (
 	"crypto/aes"
 	"crypto/cipher"
+	"crypto/rand"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/binary"
 	"fmt"
 	"io"
+	"math/big"
 	"net"
 	"sync"
 	"time"
@@ -35,18 +38,23 @@ type Conn struct {
 	mu      sync.Mutex // protects writes
 	readBuf []byte     // buffered plaintext from partial reads
 
+	sendNonceBase [12]byte
+	recvNonceBase [12]byte
+
 	// Exported fields for upper protocol layers to inspect.
 	Verified     bool   // true if client was authenticated
 	ServerName   string // SNI used during handshake
 }
 
 // newConn creates an encrypted connection from derived keys.
-func newConn(raw net.Conn, reader io.Reader, c2sKey, s2cKey []byte, isClient bool) (*Conn, error) {
-	var sendKey, recvKey []byte
+func newConn(raw net.Conn, reader io.Reader, k *keys, isClient bool) (*Conn, error) {
+	var sendKey, recvKey, sendNonce, recvNonce []byte
 	if isClient {
-		sendKey, recvKey = c2sKey, s2cKey
+		sendKey, recvKey = k.c2sKey, k.s2cKey
+		sendNonce, recvNonce = k.c2sNonceBase, k.s2cNonceBase
 	} else {
-		sendKey, recvKey = s2cKey, c2sKey
+		sendKey, recvKey = k.s2cKey, k.c2sKey
+		sendNonce, recvNonce = k.s2cNonceBase, k.c2sNonceBase
 	}
 
 	sendBlock, err := aes.NewCipher(sendKey)
@@ -67,17 +75,25 @@ func newConn(raw net.Conn, reader io.Reader, c2sKey, s2cKey []byte, isClient boo
 		return nil, err
 	}
 
-	return &Conn{
+	conn := &Conn{
 		raw:     raw,
 		reader:  reader,
 		sendGCM: sendGCM,
 		recvGCM: recvGCM,
-	}, nil
+	}
+	copy(conn.sendNonceBase[:], sendNonce)
+	copy(conn.recvNonceBase[:], recvNonce)
+	return conn, nil
 }
 
-func makeNonce(seq uint64) []byte {
+func makeNonce(base [12]byte, seq uint64) []byte {
 	nonce := make([]byte, 12)
-	binary.BigEndian.PutUint64(nonce[4:], seq)
+	copy(nonce, base[:])
+	var seqBuf [8]byte
+	binary.BigEndian.PutUint64(seqBuf[:], seq)
+	for i := 0; i < 8; i++ {
+		nonce[4+i] ^= seqBuf[i]
+	}
 	return nonce
 }
 
@@ -86,7 +102,7 @@ func (c *Conn) Write(p []byte) (int, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	nonce := makeNonce(c.sendSeq)
+	nonce := makeNonce(c.sendNonceBase, c.sendSeq)
 	c.sendSeq++
 
 	ciphertext := c.sendGCM.Seal(nil, nonce, p, nil)
@@ -112,7 +128,7 @@ func (c *Conn) Read(p []byte) (int, error) {
 		return 0, fmt.Errorf("unexpected record type: 0x%02x", recType)
 	}
 
-	nonce := makeNonce(c.recvSeq)
+	nonce := makeNonce(c.recvNonceBase, c.recvSeq)
 	c.recvSeq++
 
 	plaintext, err := c.recvGCM.Open(nil, nonce, payload, nil)
@@ -167,9 +183,11 @@ func (c *Conn) HandshakeAddress() string {
 // --- internal crypto helpers ---
 
 type keys struct {
-	authKey []byte // 32 bytes
-	c2sKey  []byte // 32 bytes
-	s2cKey  []byte // 32 bytes
+	authKey      []byte // 32 bytes
+	c2sKey       []byte // 32 bytes
+	s2cKey       []byte // 32 bytes
+	c2sNonceBase []byte // 12 bytes
+	s2cNonceBase []byte // 12 bytes
 }
 
 func deriveKeys(psk, clientRandom, serverRandom []byte) (*keys, error) {
@@ -177,32 +195,58 @@ func deriveKeys(psk, clientRandom, serverRandom []byte) (*keys, error) {
 	salt = append(salt, clientRandom...)
 	salt = append(salt, serverRandom...)
 
-	derive := func(info string) ([]byte, error) {
+	derive := func(info string, size int) ([]byte, error) {
 		r := hkdf.New(sha256.New, psk, salt, []byte(info))
-		key := make([]byte, 32)
+		key := make([]byte, size)
 		if _, err := io.ReadFull(r, key); err != nil {
 			return nil, fmt.Errorf("hkdf(%s): %w", info, err)
 		}
 		return key, nil
 	}
 
-	authKey, err := derive("bayed-auth")
+	authKey, err := derive("bayed-auth", 32)
 	if err != nil {
 		return nil, err
 	}
-	c2s, err := derive("bayed-c2s")
+	c2s, err := derive("bayed-c2s", 32)
 	if err != nil {
 		return nil, err
 	}
-	s2c, err := derive("bayed-s2c")
+	s2c, err := derive("bayed-s2c", 32)
+	if err != nil {
+		return nil, err
+	}
+	c2sNonce, err := derive("bayed-c2s-nonce", 12)
+	if err != nil {
+		return nil, err
+	}
+	s2cNonce, err := derive("bayed-s2c-nonce", 12)
 	if err != nil {
 		return nil, err
 	}
 
-	return &keys{authKey: authKey, c2sKey: c2s, s2cKey: s2c}, nil
+	return &keys{
+		authKey:      authKey,
+		c2sKey:       c2s,
+		s2cKey:       s2c,
+		c2sNonceBase: c2sNonce,
+		s2cNonceBase: s2cNonce,
+	}, nil
 }
 
 func makeAuthPayload(authKey, clientRandom []byte) ([]byte, error) {
+	// Pad to realistic HTTP request size (406–1605 bytes plaintext)
+	// to avoid fingerprinting by fixed payload length.
+	padSize, err := cryptoRandIntn(1200)
+	if err != nil {
+		return nil, fmt.Errorf("rand pad: %w", err)
+	}
+	plaintext := make([]byte, len(authPlaintext)+400+padSize)
+	copy(plaintext, authPlaintext)
+	if _, err := rand.Read(plaintext[len(authPlaintext):]); err != nil {
+		return nil, fmt.Errorf("rand fill: %w", err)
+	}
+
 	block, err := aes.NewCipher(authKey)
 	if err != nil {
 		return nil, err
@@ -211,7 +255,7 @@ func makeAuthPayload(authKey, clientRandom []byte) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	return gcm.Seal(nil, clientRandom[:12], []byte(authPlaintext), nil), nil
+	return gcm.Seal(nil, clientRandom[:12], plaintext, nil), nil
 }
 
 func verifyAuthPayload(authKey, clientRandom, ciphertext []byte) bool {
@@ -227,10 +271,24 @@ func verifyAuthPayload(authKey, clientRandom, ciphertext []byte) bool {
 	if err != nil {
 		return false
 	}
-	return string(plaintext) == authPlaintext
+	if len(plaintext) < len(authPlaintext) {
+		return false
+	}
+	return subtle.ConstantTimeCompare(plaintext[:len(authPlaintext)], []byte(authPlaintext)) == 1
 }
 
 func makeConfirmPayload(authKey, serverRandom []byte) ([]byte, error) {
+	// Pad to realistic HTTP response size to avoid fingerprinting.
+	padSize, err := cryptoRandIntn(1200)
+	if err != nil {
+		return nil, fmt.Errorf("rand pad: %w", err)
+	}
+	plaintext := make([]byte, len(vpnConfirm)+400+padSize)
+	copy(plaintext, vpnConfirm)
+	if _, err := rand.Read(plaintext[len(vpnConfirm):]); err != nil {
+		return nil, fmt.Errorf("rand fill: %w", err)
+	}
+
 	block, err := aes.NewCipher(authKey)
 	if err != nil {
 		return nil, err
@@ -239,7 +297,7 @@ func makeConfirmPayload(authKey, serverRandom []byte) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	return gcm.Seal(nil, serverRandom[:12], []byte(vpnConfirm), nil), nil
+	return gcm.Seal(nil, serverRandom[:12], plaintext, nil), nil
 }
 
 func verifyConfirmPayload(authKey, serverRandom, ciphertext []byte) bool {
@@ -255,5 +313,17 @@ func verifyConfirmPayload(authKey, serverRandom, ciphertext []byte) bool {
 	if err != nil {
 		return false
 	}
-	return string(plaintext) == vpnConfirm
+	if len(plaintext) < len(vpnConfirm) {
+		return false
+	}
+	return subtle.ConstantTimeCompare(plaintext[:len(vpnConfirm)], []byte(vpnConfirm)) == 1
+}
+
+// cryptoRandIntn returns a cryptographically random int in [0, n).
+func cryptoRandIntn(n int) (int, error) {
+	r, err := rand.Int(rand.Reader, big.NewInt(int64(n)))
+	if err != nil {
+		return 0, err
+	}
+	return int(r.Int64()), nil
 }

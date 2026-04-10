@@ -99,21 +99,18 @@ func Server(c net.Conn, config *ServerConfig) (*Conn, error) {
 
 	go func() {
 		defer close(upstreamDone)
-		buf := make([]byte, 32*1024)
 		for {
-			n, readErr := upstreamBuf.Read(buf)
-			if n > 0 {
-				upstreamMu.Lock()
-				stopped := upstreamStopped
-				upstreamMu.Unlock()
-				if stopped {
-					return
-				}
-				if _, err := c.Write(buf[:n]); err != nil {
-					return
-				}
-			}
+			_, _, raw, readErr := readTLSRecord(upstreamBuf)
 			if readErr != nil {
+				return
+			}
+			upstreamMu.Lock()
+			stopped := upstreamStopped
+			upstreamMu.Unlock()
+			if stopped {
+				return
+			}
+			if _, err := c.Write(raw); err != nil {
 				return
 			}
 		}
@@ -148,7 +145,7 @@ func Server(c net.Conn, config *ServerConfig) (*Conn, error) {
 				}
 
 				// Create encrypted conn
-				conn, err := newConn(c, clientBuf, k.c2sKey, k.s2cKey, false)
+				conn, err := newConn(c, clientBuf, k, false)
 				if err != nil {
 					return nil, err
 				}

@@ -17,6 +17,11 @@ import (
 func Client(c net.Conn, config *ClientConfig) (*Conn, error) {
 	l := config.logger()
 
+	// Wrap conn in bufio before uTLS handshake so that any bytes read
+	// ahead by the TCP stack during handshake remain accessible after.
+	tcpBuf := bufio.NewReaderSize(c, 16384)
+	wrapped := &readerConn{Conn: c, r: tcpBuf}
+
 	// Step 1: uTLS handshake
 	tlsCfg := &tls.Config{
 		ServerName:         config.ServerName,
@@ -24,7 +29,7 @@ func Client(c net.Conn, config *ClientConfig) (*Conn, error) {
 	}
 
 	helloID := resolveFingerprint(config.Fingerprint)
-	uconn := tls.UClient(c, tlsCfg, helloID)
+	uconn := tls.UClient(wrapped, tlsCfg, helloID)
 
 	if err := uconn.Handshake(); err != nil {
 		c.Close()
@@ -75,9 +80,9 @@ func Client(c net.Conn, config *ClientConfig) (*Conn, error) {
 		l.Printf("[bayed] auth beacon sent (%d bytes)", len(authPayload))
 	}
 
-	// Step 5: Wait for server confirmation
-	tcpBuf := bufio.NewReader(rawConn)
-
+	// Step 5: Wait for server confirmation.
+	// We reuse tcpBuf (created before uTLS) which preserves any bytes
+	// that were read ahead during the handshake.
 	for i := 0; i < 10; i++ {
 		recType, payload, _, err := readTLSRecord(tcpBuf)
 		if err != nil {
@@ -93,7 +98,7 @@ func Client(c net.Conn, config *ClientConfig) (*Conn, error) {
 			}
 
 			// Step 6: Encrypted tunnel
-			conn, err := newConn(rawConn, tcpBuf, k.c2sKey, k.s2cKey, true)
+			conn, err := newConn(rawConn, tcpBuf, k, true)
 			if err != nil {
 				c.Close()
 				return nil, fmt.Errorf("create conn: %w", err)
@@ -109,6 +114,18 @@ func Client(c net.Conn, config *ClientConfig) (*Conn, error) {
 }
 
 // --- fingerprint helpers ---
+
+// readerConn wraps a net.Conn so that Read() goes through a bufio.Reader.
+// This preserves any bytes buffered during the uTLS handshake that would
+// otherwise be lost when switching to raw conn I/O.
+type readerConn struct {
+	net.Conn
+	r *bufio.Reader
+}
+
+func (c *readerConn) Read(b []byte) (int, error) {
+	return c.r.Read(b)
+}
 
 func resolveFingerprint(name string) tls.ClientHelloID {
 	switch name {
