@@ -16,14 +16,17 @@ import "github.com/EvrkMs/bayed-tls/bayed"
 // Server-side: wrap an accepted connection
 conn, err := bayed.Server(tcpConn, &bayed.ServerConfig{
     PSK:          []byte("secret"),
-    UpstreamAddr: "google.com:443",
+    UpstreamAddr: "www.google.com:443",
+    // Optional: multiple upstreams (SNI-matched)
+    // Upstreams: []string{"www.google.com:443", "maps.google.com:443"},
+    // MaxHandshakesPerSec: 100,
 })
 // conn implements net.Conn — pass to VLESS/VMess/etc.
 
 // Client-side: wrap a dialed connection
 conn, err := bayed.Client(tcpConn, &bayed.ClientConfig{
     PSK:         []byte("secret"),
-    ServerName:  "google.com",
+    ServerName:  "www.google.com",
     Fingerprint: "chrome",
 })
 // conn implements net.Conn — pass to VLESS/VMess/etc.
@@ -42,7 +45,8 @@ conn, err := bayed.Client(tcpConn, &bayed.ClientConfig{
 
 - **Chrome fingerprint** — uTLS mimics Chrome 133/131/120-PQ, Firefox, Safari, Edge, etc.
 - **Passthrough** — unauthenticated clients get real `google.com` (active probe resistant)
-- **Fake PSK** — optional fake `pre_shared_key` extension (~50% of connections look like session resumption)
+- **Multi-upstream** — optional SNI-based routing across multiple upstream hosts (e.g. several Google/Cloudflare domains)
+- **Rate limiting** — configurable handshake rate limiter to protect upstream from abuse
 - **Full net.Conn** — implements `Read`, `Write`, `Close`, `SetDeadline`, etc.
 - **Xray-compatible** — designed as a security type alongside Reality/TLS
 
@@ -69,11 +73,12 @@ Then use `bayed.Server()` / `bayed.Client()` in your transport handler, just lik
 
 ```
 bayed/
-  config.go     — ServerConfig, ClientConfig
+  config.go     — ServerConfig, ClientConfig, SNI routing
   server.go     — Server(conn, config) → (*Conn, error)
   client.go     — Client(conn, config) → (*Conn, error)
   conn.go       — Conn (net.Conn), crypto helpers
-  record.go     — TLS record I/O
+  record.go     — TLS record I/O, ClientHello/ServerHello parsing
+  ratelimit.go  — Token-bucket rate limiter
   errors.go     — ErrNotBayed
 ```
 
