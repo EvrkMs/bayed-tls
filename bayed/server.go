@@ -39,8 +39,23 @@ func Server(c net.Conn, config *ServerConfig) (*Conn, error) {
 	// Extract SNI from ClientHello for routing
 	sni := parseClientHelloSNI(payload)
 
-	// Step 2: Connect to upstream (round-robin if multiple configured)
-	upstreamAddr := config.pickUpstream()
+	// Step 2: Resolve upstream by SNI
+	upstreamAddr := config.resolveUpstream(sni)
+	if upstreamAddr == "" {
+		if config.Show {
+			l.Printf("[bayed] %s: SNI %q not in upstream list, rejecting", remote, sni)
+		}
+		return nil, ErrNotBayed
+	}
+
+	// Step 2b: Rate limit upstream handshakes
+	if !config.acquireHandshake() {
+		if config.Show {
+			l.Printf("[bayed] %s: rate limited, rejecting", remote)
+		}
+		return nil, ErrNotBayed
+	}
+
 	upstream, err := net.DialTimeout("tcp", upstreamAddr, config.upstreamTimeout())
 	if err != nil {
 		return nil, err

@@ -14,7 +14,9 @@ package bayed
 
 import (
 	"log"
-	"sync/atomic"
+	"net"
+	"strings"
+	"sync"
 	"time"
 )
 
@@ -23,15 +25,20 @@ type ServerConfig struct {
 	// PSK is the pre-shared key used for client authentication.
 	PSK []byte
 
-	// UpstreamAddr is the primary upstream TLS server (e.g. "google.com:443").
-	// Kept for backward compatibility. If Upstreams is set, this is ignored.
+	// UpstreamAddr is the primary upstream TLS server (e.g. "www.google.com:443").
+	// Used when Upstreams is empty. This is the default mode.
 	UpstreamAddr string
 
-	// Upstreams is a list of upstream TLS servers for round-robin rotation.
+	// Upstreams is an optional list of allowed upstream TLS servers.
 	// Each entry is "host:port" (e.g. "www.google.com:443").
-	// Using multiple upstreams distributes handshake load and avoids
-	// anti-abuse bans from a single provider.
+	// When set, the server matches the client's SNI against this list
+	// and routes to the matching upstream. Unknown SNIs are rejected.
+	// All upstreams should belong to the same ASN/provider for stealth.
 	Upstreams []string
+
+	// MaxHandshakesPerSec limits the rate of upstream TLS handshakes.
+	// 0 means unlimited. Recommended: 50–200 for production.
+	MaxHandshakesPerSec int
 
 	// UpstreamTimeout is the dial timeout for the upstream server.
 	// Default: 10s.
@@ -43,8 +50,13 @@ type ServerConfig struct {
 	// Logger is an optional logger. If nil, log.Default() is used.
 	Logger *log.Logger
 
-	// Internal round-robin counter.
-	rrCounter atomic.Uint64
+	// Internal: SNI→upstream lookup map, built lazily.
+	upstreamMap  map[string]string
+	upstreamOnce sync.Once
+
+	// Internal: rate limiter.
+	handshakeLimiter *rateLimiter
+	limiterOnce      sync.Once
 }
 
 func (c *ServerConfig) logger() *log.Logger {
@@ -61,15 +73,43 @@ func (c *ServerConfig) upstreamTimeout() time.Duration {
 	return 10 * time.Second
 }
 
-// pickUpstream returns the next upstream address using round-robin.
-// If Upstreams is empty, falls back to UpstreamAddr.
-func (c *ServerConfig) pickUpstream() string {
-	ups := c.Upstreams
-	if len(ups) == 0 {
+// resolveUpstream returns the upstream address for a given client SNI.
+// With a single upstream (UpstreamAddr), it always returns that address.
+// With multiple Upstreams, it matches SNI against the host part of each entry.
+// Returns "" if no match found.
+func (c *ServerConfig) resolveUpstream(sni string) string {
+	if len(c.Upstreams) == 0 {
 		return c.UpstreamAddr
 	}
-	idx := c.rrCounter.Add(1) - 1
-	return ups[idx%uint64(len(ups))]
+
+	c.upstreamOnce.Do(func() {
+		c.upstreamMap = make(map[string]string, len(c.Upstreams))
+		for _, addr := range c.Upstreams {
+			host, _, err := net.SplitHostPort(addr)
+			if err != nil {
+				host = addr
+			}
+			c.upstreamMap[strings.ToLower(host)] = addr
+		}
+	})
+
+	if addr, ok := c.upstreamMap[strings.ToLower(sni)]; ok {
+		return addr
+	}
+
+	// SNI not in allowed list
+	return ""
+}
+
+// acquireHandshake checks the rate limiter. Returns true if allowed.
+func (c *ServerConfig) acquireHandshake() bool {
+	if c.MaxHandshakesPerSec <= 0 {
+		return true
+	}
+	c.limiterOnce.Do(func() {
+		c.handshakeLimiter = newRateLimiter(c.MaxHandshakesPerSec)
+	})
+	return c.handshakeLimiter.allow()
 }
 
 // ClientConfig configures the client-side bayed-tls handshake.
