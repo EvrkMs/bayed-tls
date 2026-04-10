@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"io"
 	"net"
+	"sync"
 )
 
 // Server performs the server-side bayed-tls handshake on an already-accepted
@@ -34,6 +35,9 @@ func Server(c net.Conn, config *ServerConfig) (*Conn, error) {
 	if err != nil {
 		return nil, err
 	}
+
+	// Extract SNI from ClientHello for routing
+	sni := parseClientHelloSNI(payload)
 
 	// Step 2: Connect to upstream
 	upstream, err := net.DialTimeout("tcp", config.UpstreamAddr, config.upstreamTimeout())
@@ -84,11 +88,35 @@ func Server(c net.Conn, config *ServerConfig) (*Conn, error) {
 		return nil, err
 	}
 
-	// Step 5: Proxy with auth detection
+	// Step 5: Proxy with auth detection.
+	//
+	// We buffer upstream→client writes through a mutex-protected writer
+	// so that closing upstream cleanly stops the goroutine without a
+	// race on writing to the client connection.
+	var upstreamMu sync.Mutex
+	upstreamStopped := false
 	upstreamDone := make(chan struct{})
+
 	go func() {
 		defer close(upstreamDone)
-		_, _ = io.Copy(c, upstreamBuf)
+		buf := make([]byte, 32*1024)
+		for {
+			n, readErr := upstreamBuf.Read(buf)
+			if n > 0 {
+				upstreamMu.Lock()
+				stopped := upstreamStopped
+				upstreamMu.Unlock()
+				if stopped {
+					return
+				}
+				if _, err := c.Write(buf[:n]); err != nil {
+					return
+				}
+			}
+			if readErr != nil {
+				return
+			}
+		}
 	}()
 
 	for {
@@ -103,7 +131,10 @@ func Server(c net.Conn, config *ServerConfig) (*Conn, error) {
 					l.Printf("[bayed] %s: client authenticated", remote)
 				}
 
-				// Auth OK — stop proxying upstream
+				// Auth OK — stop upstream goroutine cleanly
+				upstreamMu.Lock()
+				upstreamStopped = true
+				upstreamMu.Unlock()
 				upstream.Close()
 				<-upstreamDone
 
@@ -122,7 +153,7 @@ func Server(c net.Conn, config *ServerConfig) (*Conn, error) {
 					return nil, err
 				}
 				conn.Verified = true
-				conn.ServerName = string(clientRandom) // placeholder; SNI from ClientHello TODO
+				conn.ServerName = sni
 				return conn, nil
 			}
 		}
@@ -134,6 +165,9 @@ func Server(c net.Conn, config *ServerConfig) (*Conn, error) {
 	}
 
 	// Client disconnected without authenticating — passthrough completed
+	upstreamMu.Lock()
+	upstreamStopped = true
+	upstreamMu.Unlock()
 	upstream.Close()
 	<-upstreamDone
 	return nil, ErrNotBayed

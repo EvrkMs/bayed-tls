@@ -2,9 +2,7 @@ package bayed
 
 import (
 	"bufio"
-	"crypto/rand"
 	"fmt"
-	"math/big"
 	"net"
 
 	tls "github.com/refraction-networking/utls"
@@ -27,17 +25,6 @@ func Client(c net.Conn, config *ClientConfig) (*Conn, error) {
 
 	helloID := resolveFingerprint(config.Fingerprint)
 	uconn := tls.UClient(c, tlsCfg, helloID)
-
-	// Optionally inject fake PSK
-	if config.FakePSK && shouldInjectFakePSK() {
-		if err := uconn.BuildHandshakeState(); err != nil {
-			c.Close()
-			return nil, fmt.Errorf("build handshake state: %w", err)
-		}
-		if err := injectFakePSK(uconn); err != nil && config.Show {
-			l.Printf("[bayed] fake PSK injection failed (non-fatal): %v", err)
-		}
-	}
 
 	if err := uconn.Handshake(); err != nil {
 		c.Close()
@@ -150,42 +137,4 @@ func resolveFingerprint(name string) tls.ClientHelloID {
 	}
 }
 
-// --- fake PSK helpers ---
 
-func shouldInjectFakePSK() bool {
-	n, err := rand.Int(rand.Reader, big.NewInt(2))
-	if err != nil {
-		return false
-	}
-	return n.Int64() == 1
-}
-
-func injectFakePSK(uconn *tls.UConn) error {
-	identity := make([]byte, 224) // Chrome-like session ticket size
-	if _, err := rand.Read(identity); err != nil {
-		return err
-	}
-
-	binder := make([]byte, 32) // SHA-256
-	if _, err := rand.Read(binder); err != nil {
-		return err
-	}
-
-	ageN, err := rand.Int(rand.Reader, big.NewInt(600000))
-	if err != nil {
-		return err
-	}
-
-	cache := tls.NewLRUClientSessionCache(1)
-	uconn.SetSessionCache(cache)
-
-	return uconn.SetPskExtension(&tls.FakePreSharedKeyExtension{
-		Identities: []tls.PskIdentity{
-			{
-				Label:               identity,
-				ObfuscatedTicketAge: uint32(ageN.Int64()),
-			},
-		},
-		Binders: [][]byte{binder},
-	})
-}

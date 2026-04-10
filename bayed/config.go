@@ -65,10 +65,6 @@ type ClientConfig struct {
 	// "firefox", "safari", "ios", "edge", "random", "go".
 	Fingerprint string
 
-	// FakePSK enables injecting a fake pre_shared_key extension
-	// in ~50% of connections to simulate TLS session resumption.
-	FakePSK bool
-
 	// InsecureSkipVerify skips TLS certificate verification (testing only).
 	InsecureSkipVerify bool
 
