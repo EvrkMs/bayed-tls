@@ -4,14 +4,17 @@ import (
 	"bufio"
 	"fmt"
 	"net"
-	"time"
 
 	tls "github.com/refraction-networking/utls"
 )
 
-// Client performs the client-side bayed-tls handshake on an already-dialed
-// TCP connection. It does the uTLS handshake (with Chrome fingerprint),
-// authenticates via PSK-derived beacon, and returns an encrypted *Conn.
+// Client performs the client-side bayed-tls v2 handshake on an already-dialed
+// TCP connection. It does the uTLS handshake (with the selected fingerprint),
+// derives keys from PSK + randoms, and returns an encrypted *Conn.
+//
+// v2: Zero round-trip auth. The auth tag is embedded in the first data record
+// sent by the upper protocol layer (via Write). No separate auth beacon or
+// server confirmation is exchanged.
 //
 // The returned *Conn implements net.Conn and can be used by the upper protocol
 // layer (e.g. VLESS, VMess) for transparent data transfer.
@@ -61,63 +64,31 @@ func Client(c net.Conn, config *ClientConfig) (*Conn, error) {
 		c.Close()
 		return nil, fmt.Errorf("derive keys: %w", err)
 	}
+	defer k.zero() // zero key material on all exit paths
 
-	// Step 4: Send auth beacon
-	authPayload, err := makeAuthPayload(k.authKey, clientRandom)
+	// Step 4: Compute auth tag for zero-RT authentication.
+	// The tag will be prepended to the first Write by the upper layer.
+	authTag := makeAuthTag(k.authKey, clientRandom, serverRandom)
+
+	// Step 5: Build encrypted conn.
+	// We use the raw connection (bypassing uTLS) for bayed data frames,
+	// and the tcpBuf reader to consume any bytes buffered during handshake.
+	rawConn := uconn.NetConn()
+
+	conn, err := newConn(rawConn, tcpBuf, k, true)
 	if err != nil {
 		c.Close()
-		return nil, fmt.Errorf("make auth: %w", err)
+		return nil, fmt.Errorf("create conn: %w", err)
 	}
-
-	// Auth beacon is sent as raw TLS record on the underlying TCP conn,
-	// not through the uTLS conn, because we need to bypass the TLS layer.
-	rawConn := uconn.NetConn()
-	if err := writeTLSRecord(rawConn, recordTypeApplicationData, authPayload); err != nil {
-		c.Close()
-		return nil, fmt.Errorf("write auth: %w", err)
-	}
+	conn.pendingAuthTag = authTag
+	conn.Verified = true
+	conn.ServerName = config.ServerName
 
 	if config.Show {
-		l.Printf("[bayed] auth beacon sent (%d bytes)", len(authPayload))
+		l.Printf("[bayed] v2 client ready (auth tag will be embedded in first write)")
 	}
 
-	// Step 5: Wait for server confirmation.
-	// We reuse tcpBuf (created before uTLS) which preserves any bytes
-	// that were read ahead during the handshake.
-	// Use a deadline instead of a record counter — upstream may send
-	// many records (NewSessionTicket, etc.) before our confirm arrives.
-	if err := rawConn.SetReadDeadline(time.Now().Add(10 * time.Second)); err != nil {
-		c.Close()
-		return nil, fmt.Errorf("set deadline: %w", err)
-	}
-	for {
-		recType, payload, _, err := readTLSRecord(tcpBuf)
-		if err != nil {
-			c.Close()
-			return nil, fmt.Errorf("read confirm: %w", err)
-		}
-		if recType != recordTypeApplicationData {
-			continue
-		}
-		if verifyConfirmPayload(k.authKey, serverRandom, payload) {
-			if config.Show {
-				l.Printf("[bayed] server confirmed!")
-			}
-
-			// Clear deadline before entering tunnel mode.
-			_ = rawConn.SetReadDeadline(time.Time{})
-
-			// Step 6: Encrypted tunnel
-			conn, err := newConn(rawConn, tcpBuf, k, true)
-			if err != nil {
-				c.Close()
-				return nil, fmt.Errorf("create conn: %w", err)
-			}
-			conn.Verified = true
-			conn.ServerName = config.ServerName
-			return conn, nil
-		}
-	}
+	return conn, nil
 }
 
 // --- fingerprint helpers ---
@@ -160,5 +131,3 @@ func resolveFingerprint(name string) tls.ClientHelloID {
 		return tls.HelloChrome_Auto
 	}
 }
-
-
